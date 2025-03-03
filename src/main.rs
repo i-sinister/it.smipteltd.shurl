@@ -866,22 +866,50 @@ pub(crate) mod api {
             configure, CreateSlugRequest
         };
 
-        async fn app_and_state(factory: fn(&mut Cqrs)) ->
-            (impl actix_web::dev::Service<actix_http::Request, Response = actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, Error = actix_web::Error>, web::Data<Mutex<UrlShortenerService>>) {
-            let mut service = UrlShortenerService::new();
-            factory(&mut service.cqrs);
-            let state = Mutex::new(service);
-            let state = web::Data::new(state);
-            let shared_state = state.clone();
-            let app = test::init_service(App::new().app_data(state).configure(configure)).await;
-            (app, shared_state)
+        struct AppBuilder(Vec<Box<dyn Fn(&mut Cqrs)>>);
+
+        impl AppBuilder {
+            pub(crate) fn new() -> Self { Self(vec![]) }
+
+            pub(crate) fn create(mut self, slug: &str, url: &str) -> Self {
+                let slug = slug.to_string();
+                let url = url.to_string();
+                self.0.push(Box::new(move |cqrs| create_slug(cqrs, &slug, &url)));
+                self
+            }
+
+            pub(crate) fn visit(mut self, slug: &str, redirects: u64) -> Self {
+                let slug = slug.to_string();
+                self.0.push(Box::new(move |cqrs| visit_slug(cqrs, &slug, redirects)));
+                self
+            }
+
+            pub(crate) async fn build_with_state(mut self) ->
+                (impl actix_web::dev::Service<actix_http::Request, Response = actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, Error = actix_web::Error>, web::Data<Mutex<UrlShortenerService>>) {
+                let mut service = UrlShortenerService::new();
+                if !self.0.is_empty() {
+                    let cqrs = &mut service.cqrs;
+                    for config in &self.0 {
+                        config(cqrs);
+                    }
+                }
+
+                self.0.clear();
+                let state = Mutex::new(service);
+                let state = web::Data::new(state);
+                let shared_state = state.clone();
+                let app = test::init_service(App::new().app_data(state).configure(configure)).await;
+                (app, shared_state)
+            }
+
+            pub(crate) async fn build(self) ->
+                impl actix_web::dev::Service<actix_http::Request, Response = actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, Error = actix_web::Error> {
+                let (app, _) = self.build_with_state().await;
+                app
+            }
         }
 
-        async fn app(factory: fn(&mut Cqrs)) ->
-            impl actix_web::dev::Service<actix_http::Request, Response = actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, Error = actix_web::Error> {
-            let (app, _) = app_and_state(factory).await;
-            app
-        }
+        fn app_builder() -> AppBuilder { AppBuilder::new() }
 
         fn get(path: &str) -> actix_http::Request {
             test::TestRequest::get().uri(path)
@@ -898,7 +926,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_slug_list_when_empty() {
-            let app = app(|_| {}).await;
+            let app = app_builder().build().await;
             let req = get("/api/slugs");
             let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
             assert_eq!(slugs.len(), 0);
@@ -906,7 +934,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_slug_list_when_have_slugs() {
-            let app = app(|cqrs| create_slug(cqrs, "slug", "https://github.com")).await;
+            let app = app_builder().create("slug", "https://github.com").build().await;
             let req = get("/api/slugs");
             let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
             let expected_slugs = vec!["slug"];
@@ -914,14 +942,11 @@ pub(crate) mod api {
         }
 
         #[actix_web::test]
-        async fn test_slug_list_default_paging_and_sorting() {
-            let app = app(|cqrs| {
-                // create slugs in reverse order to check sorting
-                for i in (1..12).rev() {
-                    let slug = format!("slug-{i:02}");
-                    create_slug(cqrs, &slug, "https://github.com");
-                }
-            }).await;
+        async fn test_slug_list_default_paging() {
+            let app = (1..12)
+                .map(|i| format!("slug-{i:02}"))
+                .fold(app_builder(), |b, slug| b.create(&slug, "https://github.com"))
+                .build().await;
             let req = get("/api/slugs");
             let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
             let expected_slugs = vec![
@@ -930,15 +955,26 @@ pub(crate) mod api {
             ];
             assert_eq!(slugs, expected_slugs);
         }
+        #[actix_web::test]
+        async fn test_slug_list_sorting() {
+            let app = app_builder()
+                // create slugs in reverse order
+                .create("slug3", "https://github.com")
+                .create("slug2", "https://github.com")
+                .create("slug1", "https://github.com")
+                .build().await;
+            let req = get("/api/slugs");
+            let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
+            let expected_slugs = vec!["slug1", "slug2", "slug3"];
+            assert_eq!(slugs, expected_slugs);
+        }
 
         #[actix_web::test]
         async fn test_slug_list_paging() {
-            let app = app(|cqrs| {
-                for i in 1..6 {
-                    let slug = format!("slug-{i:02}");
-                    create_slug(cqrs, &slug, "https://github.com");
-                }
-            }).await;
+            let app = (1..6)
+                .map(|i| format!("slug-{i:02}"))
+                .fold(app_builder(), |b, slug| b.create(&slug, "https://github.com"))
+                .build().await;
             let req = get("/api/slugs?skip=2&take=3");
             let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
             let expected_slugs = vec!["slug-03", "slug-04", "slug-05"];
@@ -947,7 +983,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_slug_details_missing() {
-            let app = app(|_| {}).await;
+            let app = app_builder().build().await;
             let req = get("/api/slugs/missing");
             let rest = test::call_service(&app, req).await;
             assert_eq!(rest.status(), StatusCode::NOT_FOUND);
@@ -955,7 +991,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_slug_details_not_visited() {
-            let app = app(|cqrs| create_slug(cqrs, "slug", "http://github.com")).await;
+            let app = app_builder().create("slug", "http://github.com").build().await;
             let req = get("/api/slugs/slug");
             let stats: Stats = test::call_and_read_body_json(&app, req).await;
             let expected = create_stats("slug", "http://github.com", 0);
@@ -964,10 +1000,10 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_slug_details_visited() {
-            let app = app(|cqrs| {
-                create_slug(cqrs, "slug", "http://github.com");
-                visit_slug(cqrs, "slug", 2);
-            }).await;
+            let app = app_builder()
+                .create("slug", "http://github.com")
+                .visit("slug", 2)
+                .build().await;
             let req = get("/api/slugs/slug");
             let stats: Stats = test::call_and_read_body_json(&app, req).await;
             let expected = create_stats("slug", "http://github.com", 2);
@@ -976,7 +1012,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_generated_slug() {
-            let app = app(|_| {}).await;
+            let app = app_builder().build().await;
             let data = CreateSlugRequest { slug: Option::None, url: "http://github.com".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -987,7 +1023,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_slug() {
-            let app = app(|_| {}).await;
+            let app = app_builder().build().await;
             let data = CreateSlugRequest { slug: Some("guls".to_string()), url: "http://github.com".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -998,7 +1034,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_duplicate_slug() {
-            let app = app(|cqrs| create_slug(cqrs, "slug", "https://github.com")).await;
+            let app = app_builder().create("slug", "https://github.com").build().await;
             let data = CreateSlugRequest { slug: Some("slug".to_string()), url: "http://google.com".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -1007,7 +1043,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_slug_invalid_slug() {
-            let app = app(|_| {}).await;
+            let app = app_builder().build().await;
             let data = CreateSlugRequest { slug: Some("slug!".to_string()), url: "http://google.com".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -1016,7 +1052,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_slug_invalid_url() {
-            let app = app(|_| {}).await;
+            let app = app_builder().build().await;
             let data = CreateSlugRequest { slug: Some("slug".to_string()), url: "not-an-url".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -1025,7 +1061,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_visit_slug() {
-            let (app, state) = app_and_state(|cqrs| create_slug(cqrs, "slug", "https://github.com")).await;
+            let (app, state) = app_builder().create("slug", "https://github.com").build_with_state().await;
             let req = get("/s/slug");
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
@@ -1048,7 +1084,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_visit_missing_slug() {
-            let app = app(|_| { }).await;
+            let app = app_builder().build().await;
             let req = get("/s/slug");
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1056,7 +1092,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_visit_invalid_slug() {
-            let app = app(|_| { }).await;
+            let app = app_builder().build().await;
             let req = get("/s/!not-a-slug");
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
