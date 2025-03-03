@@ -41,8 +41,6 @@
 //! - Event Sourcing should be actively utilized for implementing logic, rather
 //!   than existing without a clear purpose.
 
-#![allow(unused_variables, dead_code)]
-
 /// All possible errors of the [`UrlShortenerService`].
 #[derive(Debug, PartialEq)]
 pub enum ShortenerError {
@@ -231,7 +229,7 @@ mod domain {
         #[test]
         fn test_default_generator_generate() {
             let mut generator = DefaultSlugGenerator::new();
-            for i in 1..100 {
+            for _ in 1..100 {
                 assert!(validate_slug(generator.generate()).is_ok());
             }
         }
@@ -286,6 +284,7 @@ mod cqrs {
         fn execute(&self, params: P) -> R;
     }
 
+    #[derive(PartialEq, Debug)]
     pub(crate) struct SlugAggregate { slug: Slug, url: Url, redirects: u64 }
 
     pub(crate) struct EventStorage(pub(crate) Vec<EventEnvelope>);
@@ -302,14 +301,16 @@ mod cqrs {
         pub(crate) fn created(slug: Slug, url: Url) -> Self { SlugEvent::SlugCreated { slug: slug, url: url } }
         pub(crate) fn visited(slug: Slug, redirects: u64) -> Self { SlugEvent::SlugVisited { slug: slug, redirects: redirects } }
 
-        pub fn aggregate_id(&self) -> String {
+        #[cfg(test)]
+        pub(crate) fn aggregate_id(&self) -> String {
             match self {
                 SlugEvent::SlugCreated { slug , .. } => slug.0.clone(),
                 SlugEvent::SlugVisited { slug , .. } => slug.0.clone(),
             }
         }
 
-        pub fn wrap(self) -> EventEnvelope {
+        #[cfg(test)]
+        pub(crate) fn wrap(self) -> EventEnvelope {
             EventEnvelope { aggregate_id: self.aggregate_id(), event: self }
         }
     }
@@ -446,7 +447,7 @@ mod cqrs {
                     self.url = url.clone();
                     self.redirects = 0;
                 },
-                SlugEvent::SlugVisited { slug, redirects } => {
+                SlugEvent::SlugVisited { redirects, .. } => {
                     self.redirects = *redirects;
                 }
             }
@@ -469,10 +470,10 @@ mod cqrs {
     }
 
     impl EventListener for SlugListQuery {
-        fn dispatch(&mut self, slug: &Slug, events: &[SlugEvent]) {
+        fn dispatch(&mut self, _: &Slug, events: &[SlugEvent]) {
             for event in events {
                 match event {
-                    SlugEvent::SlugCreated { slug, url } => {
+                    SlugEvent::SlugCreated { slug, .. } => {
                         self.0.insert(slug.0.clone());
                     },
                     _ => {}
@@ -506,7 +507,7 @@ mod cqrs {
     }
 
     impl EventListener for SlugDetailsQuery {
-        fn dispatch(&mut self, slug: &Slug, events: &[SlugEvent]) {
+        fn dispatch(&mut self, _: &Slug, events: &[SlugEvent]) {
             for event in events {
                 match event {
                     SlugEvent::SlugCreated { slug, url } => {
@@ -535,10 +536,10 @@ mod cqrs {
     }
 
     impl EventListener for UsedSlugsQuery {
-        fn dispatch(&mut self, slug: &Slug, events: &[SlugEvent]) {
+        fn dispatch(&mut self, _: &Slug, events: &[SlugEvent]) {
             for event in events {
                 match event {
-                    SlugEvent::SlugCreated { slug, url } => {
+                    SlugEvent::SlugCreated { slug, .. } => {
                         self.0.insert(slug.0.clone());
                     },
                     _ => { }
@@ -560,7 +561,7 @@ mod cqrs {
             super::domain::SlugGenerator,
             super::test::shared::*,
             super::{ Url, ShortenerError },
-            { Cqrs, SlugAggregate, SlugEvent }
+            { Cqrs, SlugAggregate, SlugEvent, EventEnvelope }
         };
 
         static VALID_URL_SLICE:&'static str = "http://github.com";
@@ -601,15 +602,15 @@ mod cqrs {
             let mut cqrs = create_cqrs();
             let command = create_create_command(None, VALID_URL_SLICE);
             let mut aggregate = SlugAggregate::new();
-            let result = cqrs.process(Some(&mut aggregate), command).expect("should create slug");
+            cqrs.process(Some(&mut aggregate), command).expect("should create slug");
             assert_eq!(aggregate.url.0, VALID_URL_SLICE);
-            assert_eq!(cqrs.store.0.len(), 1);
-            assert_eq!(cqrs.store.0[0].aggregate_id, "aaa");
-            let expected_slug = slug("aaa");
-            let expected_url = VALID_URL.clone();
-            assert!(matches!(&cqrs.store.0[0].event, SlugEvent::SlugCreated { slug: expected_slug, url: expected_url }));
+            let expected_events: Vec<EventEnvelope> = create_created_event("aaa", VALID_URL_SLICE)
+                .into_iter()
+                .map(SlugEvent::wrap)
+                .collect();
+            assert_eq!(cqrs.store.0, expected_events);
             let slug_aggregate = cqrs.store.load("aaa").expect("slug should be created");
-            assert!(matches!(slug_aggregate, SlugAggregate { slug: expected_slug, url: expected_url, redirects: 0 }));
+            assert_eq!(slug_aggregate, SlugAggregate { slug: slug("aaa"), url: VALID_URL.clone(), redirects: 0 });
         }
 
         #[test]
@@ -621,7 +622,7 @@ mod cqrs {
             assert_eq!(result, Err(ShortenerError::InvalidUrl));
             assert_eq!(cqrs.store.0.len(), 0);
             let slug_aggregate = cqrs.store.load("aaa");
-            assert!(matches!(slug_aggregate, None));
+            assert_eq!(slug_aggregate, None);
         }
 
         #[test]
@@ -633,9 +634,7 @@ mod cqrs {
             assert_eq!(result.slug, slug("valid-slug"));
             assert_eq!(cqrs.store.0.len(), 1);
             let slug_aggregate = cqrs.store.load("valid-slug").expect("slug should be created");
-            let expected_slug = slug("valid-slug");
-            let expected_url = VALID_URL.clone();
-            assert!(matches!(slug_aggregate, SlugAggregate { slug: expected_slug, url: expected_url, redirects: 0 }));
+            assert_eq!(slug_aggregate, SlugAggregate { slug: slug("valid-slug"), url: VALID_URL.clone(), redirects: 0 });
         }
 
         #[test]
@@ -681,13 +680,13 @@ mod cqrs {
             assert_eq!(result.slug.0, valid_slug);
             assert_eq!(result.url.0, VALID_URL_SLICE);
             assert_eq!(cqrs.store.0.len(), 2);
-            assert_eq!(cqrs.store.0[0].aggregate_id, valid_slug);
-            assert_eq!(cqrs.store.0[1].aggregate_id, valid_slug);
-            let expected_url = VALID_URL.clone();
-            assert!(matches!(&cqrs.store.0[0].event, SlugEvent::SlugCreated { slug: expected_slug, url: expected_url }));
-            assert!(matches!(&cqrs.store.0[1].event, SlugEvent::SlugVisited { slug: expected_slug, redirects: 1 }));
+            let expected: Vec<EventEnvelope> = create_created_event(valid_slug, VALID_URL_SLICE).into_iter()
+                .chain(create_visited_event(valid_slug, 1).into_iter())
+                .map(SlugEvent::wrap)
+                .collect();
+            assert_eq!(cqrs.store.0, expected);
             let aggregate = cqrs.store.load(valid_slug).expect("slug should exist");
-            assert!(matches!(aggregate, SlugAggregate { slug: _slug, url: expected_url, redirects: 1 }));
+            assert_eq!(aggregate, SlugAggregate { slug: slug(valid_slug), url: VALID_URL.clone(), redirects: 1 });
         }
 
         #[test]
@@ -699,7 +698,7 @@ mod cqrs {
             let command = create_visit_command("!invalid slug");
             let result = cqrs.load_and_process("missing-slug", command);
             assert!(result.is_err());
-            assert!(matches!(result, Err(ShortenerError::SlugNotFound)));
+            assert_eq!(result, Err(ShortenerError::SlugNotFound));
         }
 
         #[test]
@@ -711,7 +710,7 @@ mod cqrs {
             let command = create_visit_command("missing");
             let result = cqrs.load_and_process("missing-slug", command);
             assert!(result.is_err());
-            assert!(matches!(result, Err(ShortenerError::SlugNotFound)));
+            assert_eq!(result, Err(ShortenerError::SlugNotFound));
         }
     }
 }
@@ -899,7 +898,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_slug_list_when_empty() {
-            let app = app(|cqrs| {}).await;
+            let app = app(|_| {}).await;
             let req = get("/api/slugs");
             let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
             assert_eq!(slugs.len(), 0);
@@ -948,7 +947,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_slug_details_missing() {
-            let app = app(|cqrs| {}).await;
+            let app = app(|_| {}).await;
             let req = get("/api/slugs/missing");
             let rest = test::call_service(&app, req).await;
             assert_eq!(rest.status(), StatusCode::NOT_FOUND);
@@ -977,7 +976,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_generated_slug() {
-            let app = app(|cqrs| {}).await;
+            let app = app(|_| {}).await;
             let data = CreateSlugRequest { slug: Option::None, url: "http://github.com".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -988,7 +987,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_slug() {
-            let app = app(|cqrs| {}).await;
+            let app = app(|_| {}).await;
             let data = CreateSlugRequest { slug: Some("guls".to_string()), url: "http://github.com".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -1008,7 +1007,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_slug_invalid_slug() {
-            let app = app(|cqrs| {}).await;
+            let app = app(|_| {}).await;
             let data = CreateSlugRequest { slug: Some("slug!".to_string()), url: "http://google.com".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -1017,7 +1016,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_create_slug_invalid_url() {
-            let app = app(|cqrs| {}).await;
+            let app = app(|_| {}).await;
             let data = CreateSlugRequest { slug: Some("slug".to_string()), url: "not-an-url".to_string() };
             let req = post("/api/slugs", data);
             let resp = test::call_service(&app, req).await;
@@ -1049,7 +1048,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_visit_missing_slug() {
-            let app = app(|cqrs| { }).await;
+            let app = app(|_| { }).await;
             let req = get("/s/slug");
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -1057,7 +1056,7 @@ pub(crate) mod api {
 
         #[actix_web::test]
         async fn test_visit_invalid_slug() {
-            let app = app(|cqrs| { }).await;
+            let app = app(|_| { }).await;
             let req = get("/s/!not-a-slug");
             let resp = test::call_service(&app, req).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
