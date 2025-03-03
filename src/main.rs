@@ -62,15 +62,15 @@ use serde::{ Serialize, Deserialize };
 
 /// A unique string (or alias) that represents the shortened version of the
 /// URL.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Slug(pub String);
 
 /// The original URL that the short link points to.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Url(pub String);
 
 /// Shortened URL representation.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShortLink {
     /// A unique string (or alias) that represents the shortened version of the
     /// URL.
@@ -81,7 +81,7 @@ pub struct ShortLink {
 }
 
 /// Statistics of the [`ShortLink`].
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stats {
     /// [`ShortLink`] to which this [`Stats`] are related.
     pub link: ShortLink,
@@ -179,7 +179,7 @@ struct Cqrs {
     used_slugs_query: UsedSlugsQuery,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 enum  SlugEvent {
     SlugCreated { slug: Slug, url: Url },
     SlugVisited { slug: Slug, redirects: u64 }
@@ -219,7 +219,7 @@ struct SlugAggregate { slug: Slug, url: Url, redirects: u64 }
 
 struct EventStorage(Vec<EventEnvelope>);
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 struct EventEnvelope { aggregate_id: String, event: SlugEvent }
 
 impl SlugCommand {
@@ -230,6 +230,17 @@ impl SlugCommand {
 impl SlugEvent {
     fn created(slug: Slug, url: Url) -> Self { SlugEvent::SlugCreated { slug: slug, url: url } }
     fn visited(slug: Slug, redirects: u64) -> Self { SlugEvent::SlugVisited { slug: slug, redirects: redirects } }
+
+    pub fn aggregate_id(&self) -> String {
+        match self {
+            SlugEvent::SlugCreated { slug , .. } => slug.0.clone(),
+            SlugEvent::SlugVisited { slug , .. } => slug.0.clone(),
+        }
+    }
+
+    pub fn wrap(self) -> EventEnvelope {
+        EventEnvelope { aggregate_id: self.aggregate_id(), event: self }
+    }
 }
 
 impl Cqrs {
@@ -501,6 +512,54 @@ impl Query<&String, bool> for UsedSlugsQuery {
     }
 }
 
+
+#[cfg(test)]
+mod shared_test {
+    use crate::EventEnvelope;
+
+    use super::{ Slug, Url, Cqrs, SlugEvent, SlugCommand, Stats, ShortLink };
+
+    pub fn slug(slug: &str) -> Slug { Slug(slug.to_string()) }
+
+    pub fn url(url: &str) -> Url { Url(url.to_string()) }
+
+    pub fn create_stats(slug_str: &str, url_str: &str, redirects: u64) -> Stats {
+        Stats { link: ShortLink { slug: slug(slug_str), url: url(url_str) }, redirects: redirects }
+    }
+
+    pub fn create_create_command(maybe_slug: Option<&str>, url_slice: &str) -> SlugCommand {
+        SlugCommand::create(maybe_slug.map(slug), url(url_slice))
+    }
+
+    pub fn create_visit_command(slug_slice: &str) -> SlugCommand {
+        SlugCommand::visit(slug(slug_slice))
+    }
+
+    pub fn create_created_event(slug_slice: &str, url_slice: &str) -> Vec<SlugEvent> {
+        vec![SlugEvent::created(slug(slug_slice), url(url_slice))]
+    }
+
+    pub fn create_visited_event(slug_slice: &str, redirects: u64) -> Vec<SlugEvent> {
+        vec![SlugEvent::visited(slug(slug_slice), redirects)]
+    }
+
+    /// simulates slug creation
+    pub fn create_slug(cqrs: &mut Cqrs, slug_slice: &str, url_slice: &str) {
+        let slug = slug(slug_slice);
+        let events = create_created_event(slug_slice, url_slice);
+        cqrs.store.commit(slug_slice, &events);
+        cqrs.dispatch(&slug, &events);
+    }
+
+    /// simulate slug visiting
+    pub fn visit_slug(cqrs: &mut Cqrs, slug_slice: &str, redirects: u64) {
+        let slug = slug(slug_slice);
+        let events = create_visited_event(slug_slice, redirects);
+        cqrs.store.commit(slug_slice, &events);
+        cqrs.dispatch(&slug, &events);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod domain_tests {
     use crate::{DefaultSlugGenerator, SlugGenerator, validate_slug};
@@ -533,10 +592,11 @@ pub(crate) mod domain_tests {
 #[cfg(test)]
 pub(crate) mod cqrs_tests {
     use super::{
-        Slug, Url, ShortenerError,
-        Cqrs, SlugAggregate, SlugCommand, SlugGenerator,
+        Url, ShortenerError,
+        Cqrs, SlugAggregate, SlugGenerator,
         SlugEvent, SlugEvent::SlugCreated, SlugEvent::SlugVisited
     };
+    use super::shared_test::*;
     use lazy_static::lazy_static;
 
     static VALID_URL_SLICE:&'static str = "http://github.com";
@@ -566,34 +626,10 @@ pub(crate) mod cqrs_tests {
         }
     }
 
-    fn slug(slug: &str) -> Slug { Slug(slug.to_string()) }
-
-    fn url(url: &str) -> Url { Url(url.to_string()) }
-
     fn create_cqrs() -> Cqrs {
         let generator = PredefinedSlugGenerator::new(vec!["aaa"]);
         let generator: Box<dyn SlugGenerator + Send + Sync> = Box::new(generator);
         Cqrs::new(Some(generator))
-    }
-
-    fn create_create_command(maybe_slug: Option<&str>, url_slice: &str) -> SlugCommand {
-        SlugCommand::create(maybe_slug.map(slug), url(url_slice))
-    }
-
-    fn create_visit_command(slug_slice: &str) -> SlugCommand {
-        SlugCommand::visit(slug(slug_slice))
-    }
-
-    fn create_created_event(slug_slice: &str, url_slice: &str) -> Vec<SlugEvent> {
-        vec![SlugEvent::created(slug(slug_slice), url(url_slice))]
-    }
-
-    /// simulates slug creation
-    fn create_slug(cqrs: &mut Cqrs, slug_slice: &str, url_slice: &str) {
-        let slug = slug(slug_slice);
-        let events = create_created_event(slug_slice, url_slice);
-        cqrs.store.commit(slug_slice, &events);
-        cqrs.dispatch(&slug, &events);
     }
 
     #[test]
@@ -719,7 +755,7 @@ pub(crate) mod cqrs_tests {
 use actix_web::{ web, get, post, http::header, App, HttpServer, HttpResponse, Responder };
 use std::{ env, sync::Mutex };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CreateSlugRequest {
     url: String,
     slug: Option<String>,
@@ -737,7 +773,7 @@ async fn create_slug(
     let url = Url(request.url);
     let slug = request.slug.map(Slug);
     match commands::CommandHandler::handle_create_short_link(service, url, slug) {
-        Ok(link) => HttpResponse::Ok().json(link.slug.0),
+        Ok(link) => HttpResponse::Created().json(format!("/s/{}", link.slug.0)),
         _ => HttpResponse::BadRequest().finish(),
     }
 }
@@ -773,7 +809,7 @@ async fn get_slug(service: web::Data<Mutex<UrlShortenerService>>, slug: web::Pat
     }
 }
 
-#[get("/{slug}")]
+#[get("/s/{slug}")]
 async fn visit_slug(service: web::Data<Mutex<UrlShortenerService>>, slug: web::Path<String>) -> HttpResponse {
     let service = service.into_inner();
     let mut guard = service.lock().unwrap();
@@ -795,12 +831,223 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::clone(&state))
-            .service(create_slug)
-            .service(get_slugs)
-            .service(get_slug)
-            .service(visit_slug)
+            .configure(configure_api)
     })
     .bind(service_url)?
     .run()
     .await
+}
+
+fn configure_api(cfg: &mut web::ServiceConfig) {
+    cfg.service(create_slug)
+        .service(get_slugs)
+        .service(get_slug)
+        .service(visit_slug);
+}
+
+#[cfg(test)]
+pub(crate) mod api_tests {
+    use actix_web::{http::{header::ContentType, StatusCode}, test, web, App };
+    use serde::Serialize;
+    use std::sync::Mutex;
+    use regex::Regex;
+
+    use super::{ configure_api, UrlShortenerService, Stats, Cqrs, CreateSlugRequest, SlugEvent, EventEnvelope };
+    use super::shared_test::*;
+
+    async fn app_and_state(factory: fn(&mut Cqrs)) ->
+        (impl actix_web::dev::Service<actix_http::Request, Response = actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, Error = actix_web::Error>, web::Data<Mutex<UrlShortenerService>>) {
+        let mut service = UrlShortenerService::new();
+        factory(&mut service.cqrs);
+        let state = Mutex::new(service);
+        let state = web::Data::new(state);
+        let shared_state = state.clone();
+        let app = test::init_service(App::new().app_data(state).configure(configure_api)).await;
+        (app, shared_state)
+    }
+
+    async fn app(factory: fn(&mut Cqrs)) ->
+        impl actix_web::dev::Service<actix_http::Request, Response = actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, Error = actix_web::Error> {
+        let (app, _) = app_and_state(factory).await;
+        app
+    }
+
+    fn get(path: &str) -> actix_http::Request {
+        test::TestRequest::get().uri(path)
+            .insert_header(ContentType::json())
+            .to_request()
+    }
+
+    fn post(path: &str, data: impl Serialize) -> actix_http::Request {
+        test::TestRequest::post().uri(path)
+            .insert_header(ContentType::json())
+            .set_json(data)
+            .to_request()
+    }
+
+    #[actix_web::test]
+    async fn test_slug_list_when_empty() {
+        let app = app(|cqrs| {}).await;
+        let req = get("/api/slugs");
+        let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
+        assert_eq!(slugs.len(), 0);
+    }
+
+    #[actix_web::test]
+    async fn test_slug_list_when_have_slugs() {
+        let app = app(|cqrs| create_slug(cqrs, "slug", "https://github.com")).await;
+        let req = get("/api/slugs");
+        let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
+        let expected_slugs = vec!["slug"];
+        assert_eq!(slugs, expected_slugs);
+    }
+
+    #[actix_web::test]
+    async fn test_slug_list_default_paging_and_sorting() {
+        let app = app(|cqrs| {
+            // create slugs in reverse order to check sorting
+            for i in (1..12).rev() {
+                let slug = format!("slug-{i:02}");
+                create_slug(cqrs, &slug, "https://github.com");
+            }
+        }).await;
+        let req = get("/api/slugs");
+        let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
+        let expected_slugs = vec![
+            "slug-01", "slug-02", "slug-03", "slug-04", "slug-05",
+            "slug-06", "slug-07", "slug-08", "slug-09", "slug-10"
+        ];
+        assert_eq!(slugs, expected_slugs);
+    }
+
+    #[actix_web::test]
+    async fn test_slug_list_paging() {
+        let app = app(|cqrs| {
+            for i in 1..6 {
+                let slug = format!("slug-{i:02}");
+                create_slug(cqrs, &slug, "https://github.com");
+            }
+        }).await;
+        let req = get("/api/slugs?skip=2&take=3");
+        let slugs: Vec<String> = test::call_and_read_body_json(&app, req).await;
+        let expected_slugs = vec!["slug-03", "slug-04", "slug-05"];
+        assert_eq!(slugs, expected_slugs);
+    }
+
+    #[actix_web::test]
+    async fn test_slug_details_missing() {
+        let app = app(|cqrs| {}).await;
+        let req = get("/api/slugs/missing");
+        let rest = test::call_service(&app, req).await;
+        assert_eq!(rest.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_slug_details_not_visited() {
+        let app = app(|cqrs| create_slug(cqrs, "slug", "http://github.com")).await;
+        let req = get("/api/slugs/slug");
+        let stats: Stats = test::call_and_read_body_json(&app, req).await;
+        let expected = create_stats("slug", "http://github.com", 0);
+        assert_eq!(stats, expected);
+    }
+
+    #[actix_web::test]
+    async fn test_slug_details_visited() {
+        let app = app(|cqrs| {
+            create_slug(cqrs, "slug", "http://github.com");
+            visit_slug(cqrs, "slug", 2);
+        }).await;
+        let req = get("/api/slugs/slug");
+        let stats: Stats = test::call_and_read_body_json(&app, req).await;
+        let expected = create_stats("slug", "http://github.com", 2);
+        assert_eq!(stats, expected);
+    }
+
+    #[actix_web::test]
+    async fn test_create_generated_slug() {
+        let app = app(|cqrs| {}).await;
+        let data = CreateSlugRequest { slug: Option::None, url: "http://github.com".to_string() };
+        let req = post("/api/slugs", data);
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let slug_url: String = test::read_body_json(resp).await;
+        assert!(Regex::new("/s/[a-zA-Z0-9][a-zA-Z0-9\\-]+").unwrap().is_match(&slug_url), "expected slug, but got '{}'", slug_url);
+    }
+
+    #[actix_web::test]
+    async fn test_create_slug() {
+        let app = app(|cqrs| {}).await;
+        let data = CreateSlugRequest { slug: Some("guls".to_string()), url: "http://github.com".to_string() };
+        let req = post("/api/slugs", data);
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let slug_url: String = test::read_body_json(resp).await;
+        assert_eq!(slug_url, "/s/guls");
+    }
+
+    #[actix_web::test]
+    async fn test_duplicate_slug() {
+        let app = app(|cqrs| create_slug(cqrs, "slug", "https://github.com")).await;
+        let data = CreateSlugRequest { slug: Some("slug".to_string()), url: "http://google.com".to_string() };
+        let req = post("/api/slugs", data);
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn test_create_slug_invalid_slug() {
+        let app = app(|cqrs| {}).await;
+        let data = CreateSlugRequest { slug: Some("slug!".to_string()), url: "http://google.com".to_string() };
+        let req = post("/api/slugs", data);
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn test_create_slug_invalid_url() {
+        let app = app(|cqrs| {}).await;
+        let data = CreateSlugRequest { slug: Some("slug".to_string()), url: "not-an-url".to_string() };
+        let req = post("/api/slugs", data);
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[actix_web::test]
+    async fn test_visit_slug() {
+        let (app, state) = app_and_state(|cqrs| create_slug(cqrs, "slug", "https://github.com")).await;
+        let req = get("/s/slug");
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        let location_header = resp.headers().get(actix_web::http::header::LOCATION);
+        assert!(location_header.is_some());
+        assert_eq!(location_header.unwrap().to_str().unwrap(), "https://github.com");
+
+        // check event is created
+        let state_arc = state.into_inner();
+        let mut guard = state_arc.lock().unwrap();
+        let service: &mut UrlShortenerService = &mut guard;
+        let events = service.cqrs.store.0.to_vec();
+        let expected_events: Vec<EventEnvelope> = create_created_event("slug", "https://github.com").into_iter()
+            .chain(create_visited_event("slug", 1).into_iter())
+            .map(SlugEvent::wrap)
+            .collect();
+        assert_eq!(events, expected_events);
+
+    }
+
+    #[actix_web::test]
+    async fn test_visit_missing_slug() {
+        let app = app(|cqrs| { }).await;
+        let req = get("/s/slug");
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_visit_invalid_slug() {
+        let app = app(|cqrs| { }).await;
+        let req = get("/s/!not-a-slug");
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
